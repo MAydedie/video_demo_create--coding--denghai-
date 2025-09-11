@@ -33,8 +33,7 @@ FEISHU_APP_SECRET = "lFsvXzRYSH61pEZGe9xV0gOtJONfEpD3"
 # 在原有config.py中添加你的模板配置
 GRAPHIC_OUTLINE_TEMPLATE_SPREADSHEET_TOKEN = "Hk5gsVA0WhIUPstUnB4cXRy1nCc"  # 你的模板token
 GRAPHIC_OUTLINE_TEMPLATE_URL = "https://dkke3lyh7o.feishu.cn/sheets/Hk5gsVA0WhIUPstUnB4cXRy1nCc"  # 模板完整URL
-
-
+FEISHU_FOLDER_TOKEN = "LApffIFkclXULcdj8WLcDiyMnPb"  # 您提供的文件夹token
 
 # 确保目录存在
 for directory in [DEFAULT_OUTPUT_DIR, DEFAULT_IMAGE_DIR, BASE_DIR / "input"]:

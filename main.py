@@ -3,33 +3,40 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 import asyncio
 import json
-import time  # 用于时间戳生成和计时
-from utils.feishu_spreadsheet import FeishuSpreadsheetUtil  # 导入飞书表格工具
+import time
+import logging
+from contextlib import asynccontextmanager
 
-from prompts import (
-    PROMPT_SELLING_POINTS_SYSTEM, PROMPT_SELLING_POINTS_USER,
-    PROMPT_CONTENT_DIRECTION_SYSTEM, PROMPT_CONTENT_DIRECTION_USER,
-    PROMPT_CREATOR_STYLE_SYSTEM, PROMPT_CREATOR_STYLE_USER,
-    PROMPT_FINAL_CONTENT_SYSTEM, PROMPT_FINAL_CONTENT_USER,
-    PROMPT_VIDEO_SCRIPT_SYSTEM,  PROMPT_VIDEO_SCRIPT_USER # 新增视频脚本配文提示词
-)
-from content_extractor import extract_text_from_ppt, extract_content_from_url, read_text_file
-from volcano_api import VolcanoAPI
+# 延迟导入非必要模块，加快启动速度
 from config import (
     VOLCANO_API_KEY, VOLCANO_API_URL, VOLCANO_MODEL_NAME,
     DEFAULT_PPT_PATH, DEFAULT_URL, DEFAULT_CREATOR_STYLE_DESC,
     DEFAULT_BRAND_NAME, DEFAULT_ADDITIONAL_INFO, DEFAULT_VIDEO_OUTLINE_PATH,
-    GRAPHIC_OUTLINE_TEMPLATE_URL  # 导入你的模板URL
+    GRAPHIC_OUTLINE_TEMPLATE_URL
 )
 
-# 初始化FastAPI应用
-app = FastAPI(title="内容策略生成系统", version="1.0.0")
+# 初始化日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 初始化火山大模型客户端
-volcano_client = VolcanoAPI(VOLCANO_API_KEY, VOLCANO_API_URL, VOLCANO_MODEL_NAME)
 
-# 初始化飞书表格工具（基于你的模板）
-spreadsheet_util = FeishuSpreadsheetUtil()
+# 定义生命周期管理器
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    try:
+        from utils.feishu_spreadsheet import FeishuSheetManager
+        # 这里不需要关闭客户端，因为FeishuSheetManager使用局部客户端
+        logger.info("资源释放完成")
+    except Exception as e:
+        logger.warning(f"关闭资源时出错: {str(e)}")
+
+
+app = FastAPI(
+    title="内容策略生成系统",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 class ProcessingRequest(BaseModel):
@@ -43,13 +50,27 @@ class ProcessingRequest(BaseModel):
     download_images: Optional[bool] = False
 
 
+# 延迟初始化火山客户端
+async def get_volcano_client():
+    from volcano_api import VolcanoAPI
+    return VolcanoAPI(VOLCANO_API_KEY, VOLCANO_API_URL, VOLCANO_MODEL_NAME)
+
+
+# 延迟初始化飞书工具
+async def get_spreadsheet_util():
+    from utils.feishu_spreadsheet import FeishuSpreadsheetUtil
+    return FeishuSpreadsheetUtil()
+
+
 async def process_with_volcano(system_prompt, user_prompt, image_paths=None):
     """通用火山大模型调用方法"""
+    volcano_client = await get_volcano_client()
     return await volcano_client.call_volcano_api(system_prompt, user_prompt, image_paths)
 
 
 async def process_selling_points(ppt_content, brand_name):
     """处理产品卖点解析"""
+    from prompts import PROMPT_SELLING_POINTS_SYSTEM, PROMPT_SELLING_POINTS_USER
     user_prompt = PROMPT_SELLING_POINTS_USER.format(
         brand_name=brand_name,
         ppt_content=ppt_content
@@ -58,7 +79,8 @@ async def process_selling_points(ppt_content, brand_name):
 
 
 async def process_content_direction(ppt_content, brand_name):
-    """处理内容方向分析（seeding/evaluation策略结果）"""
+    """处理内容方向分析"""
+    from prompts import PROMPT_CONTENT_DIRECTION_SYSTEM, PROMPT_CONTENT_DIRECTION_USER
     user_prompt = PROMPT_CONTENT_DIRECTION_USER.format(
         brand_name=brand_name,
         ppt_content=ppt_content
@@ -68,6 +90,7 @@ async def process_content_direction(ppt_content, brand_name):
 
 async def process_creator_style(url_content, image_paths):
     """处理达人风格解析"""
+    from prompts import PROMPT_CREATOR_STYLE_SYSTEM, PROMPT_CREATOR_STYLE_USER
     user_prompt = PROMPT_CREATOR_STYLE_USER.format(
         url_content=url_content
     )
@@ -75,7 +98,8 @@ async def process_creator_style(url_content, image_paths):
 
 
 async def process_final_content(content_direction, creator_style_analysis, style_type, additional_info):
-    """处理最终内容策略（seeding/evaluation二选一结果）"""
+    """处理最终内容策略"""
+    from prompts import PROMPT_FINAL_CONTENT_SYSTEM, PROMPT_FINAL_CONTENT_USER
     user_prompt = PROMPT_FINAL_CONTENT_USER.format(
         content_direction=content_direction,
         creator_style_analysis=creator_style_analysis,
@@ -86,17 +110,15 @@ async def process_final_content(content_direction, creator_style_analysis, style
 
 
 async def process_video_script(creator_style, selling_points, final_strategy, style_type):
-    """生成视频脚本配文（单独大模型调用）"""
-    # 关键修正：将 PROMPT_FINAL_CONTENT_USER 改为 PROMPT_VIDEO_SCRIPT_USER
+    """生成视频脚本配文"""
+    from prompts import PROMPT_VIDEO_SCRIPT_SYSTEM, PROMPT_VIDEO_SCRIPT_USER
     user_prompt = PROMPT_VIDEO_SCRIPT_USER.format(
         creator_style=json.dumps(creator_style, ensure_ascii=False),
         selling_points=json.dumps(selling_points, ensure_ascii=False),
         final_strategy=json.dumps(final_strategy, ensure_ascii=False),
         style_type=style_type
     )
-    # 关键修正：将 PROMPT_FINAL_CONTENT_SYSTEM 改为 PROMPT_VIDEO_SCRIPT_SYSTEM
     return await process_with_volcano(PROMPT_VIDEO_SCRIPT_SYSTEM, user_prompt)
-
 
 
 def generate_timing_visualization(timing_data: Dict[str, float]) -> str:
@@ -119,13 +141,14 @@ def generate_timing_visualization(timing_data: Dict[str, float]) -> str:
 async def generate_content_strategy(request: ProcessingRequest):
     """主接口：生成内容策略+视频脚本+飞书表格写入"""
     try:
-        timing = {}  # 时间统计字典
+        timing = {}
 
         # 1. 验证风格类型
         if request.style_type not in ["测评类", "中草类"]:
             raise HTTPException(status_code=400, detail="风格类型必须是'测评类'或'中草类'")
 
-        # 2. 提取基础内容（PPT、URL、视频大纲）
+        # 2. 提取基础内容
+        from content_extractor import extract_text_from_ppt, extract_content_from_url, read_text_file
         content_extract_start = time.time()
         ppt_content = await asyncio.to_thread(extract_text_from_ppt, request.ppt_path)
         url_content_result = await extract_content_from_url(request.url)
@@ -143,7 +166,7 @@ async def generate_content_strategy(request: ProcessingRequest):
         url_content = url_content_result["document"]
         downloaded_images = url_content_result.get("image_urls", [])
 
-        # 3. 并行执行基础模型任务（卖点、内容方向、达人风格）
+        # 3. 并行执行基础模型任务
         parallel_start = time.time()
         selling_points_task = process_selling_points(ppt_content, request.brand_name)
         content_direction_task = process_content_direction(ppt_content, request.brand_name)
@@ -163,7 +186,7 @@ async def generate_content_strategy(request: ProcessingRequest):
             if isinstance(result, str) and result.startswith("处理失败"):
                 raise HTTPException(status_code=500, detail=f"{name}失败: {result}")
 
-        # 4. 提取风格类型（优先从达人风格解析结果取，否则用请求参数）
+        # 4. 提取风格类型
         try:
             style_data = json.loads(creator_style)
             extracted_style_type = style_data.get("style_type", request.style_type)
@@ -171,14 +194,14 @@ async def generate_content_strategy(request: ProcessingRequest):
             extracted_style_type = request.style_type
         timing["风格类型提取耗时"] = time.time() - (parallel_start + timing["并行基础任务耗时"])
 
-        # 5. 生成最终策略结果（seeding/evaluation二选一）
+        # 5. 生成最终策略结果
         final_strategy_start = time.time()
         final_strategy = await process_final_content(
             content_direction, creator_style, extracted_style_type, request.additional_info
         )
         timing["最终策略生成耗时"] = time.time() - final_strategy_start
 
-        # 6. 生成视频脚本配文（单独调用大模型）
+        # 6. 生成视频脚本配文
         video_script_start = time.time()
         video_script = await process_video_script(
             creator_style=creator_style,
@@ -188,37 +211,31 @@ async def generate_content_strategy(request: ProcessingRequest):
         )
         timing["视频脚本配文生成耗时"] = time.time() - video_script_start
 
-        # 7. 写入飞书表格（基于你的模板）
+        # 7. 写入飞书表格
         sheet_start = time.time()
+        spreadsheet_util = await get_spreadsheet_util()
         sheet_result = await spreadsheet_util.full_flow(
-            video_script=video_script,  # 写入模板B2单元格
-            strategy_result=final_strategy  # 写入模板B3单元格
+            video_script=video_script,
+            strategy_result=final_strategy
         )
         timing["飞书表格处理耗时"] = time.time() - sheet_start
 
         # 8. 生成时间可视化
         timing_visualization = generate_timing_visualization(timing)
-        print(f"\n{timing_visualization}\n")
+        logger.info(f"\n{timing_visualization}\n")
 
-        # 9. 返回最终结果（包含表格链接）
-        return {
-            "status": "success",
-            "style_type_used": extracted_style_type,
-            "selling_points_analysis": selling_points,
-            "content_direction_analysis": content_direction,
-            "creator_style_analysis": creator_style,
-            "final_strategy": final_strategy,  # seeding/evaluation结果
-            "video_script": video_script,  # 视频脚本配文
-            "feishu_spreadsheet": {
-                "template_url": GRAPHIC_OUTLINE_TEMPLATE_URL,  # 你的模板URL
-                "result": sheet_result,  # 表格操作结果（含新表格链接）
-                "write_position": "B2（视频脚本）、B3（策略结果）"  # 明确写入位置
-            },
-            "timing": {
-                "各环节耗时(秒)": {k: round(v, 2) for k, v in timing.items()},
-                "可视化": timing_visualization
+        # 9. 返回飞书表格链接（根据要求，只返回链接）
+        if sheet_result.get("status") == "success":
+            return {
+                "status": "success",
+                "spreadsheet_url": sheet_result.get("spreadsheet_url"),
+                "message": "内容策略已生成并保存到飞书表格"
             }
-        }
+        else:
+            return {
+                "status": "error",
+                "message": f"内容策略生成成功，但保存到飞书表格失败: {sheet_result.get('message')}"
+            }
 
     except Exception as e:
         logger.error(f"处理请求时出错: {str(e)}", exc_info=True)
@@ -229,15 +246,10 @@ async def generate_content_strategy(request: ProcessingRequest):
 async def root():
     return {
         "message": "内容策略生成系统（已集成飞书表格功能）",
-        "template_used": GRAPHIC_OUTLINE_TEMPLATE_URL  # 显示使用的模板URL
+        "template_used": GRAPHIC_OUTLINE_TEMPLATE_URL
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    import logging  # 初始化日志
-
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
