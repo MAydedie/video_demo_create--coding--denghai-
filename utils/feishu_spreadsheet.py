@@ -295,9 +295,6 @@ class FeishuSpreadsheetUtil:
         """完整流程：创建表格并写入数据"""
         try:
             logger.info("开始处理飞书表格流程")
-            # 1. 重点日志：打印原始shot_list
-            logger.info(f"接收的分镜列表原始数据: {shot_list}")
-            logger.info(f"分镜列表长度: {len(shot_list) if shot_list else 0}")
 
             # 初始化默认值
             title = f"内容策略_{time.strftime('%Y%m%d%H%M')}"
@@ -307,31 +304,47 @@ class FeishuSpreadsheetUtil:
             # 确保shot_list不为None
             if shot_list is None:
                 shot_list = []
-                logger.warning("shot_list 为 None，使用空列表")
-            # 新增日志：检查shot_list是否为空
-            if not shot_list:
-                logger.warning("shot_list 为空列表，没有分镜数据可写入")
 
-            # 2. 解析视频脚本（关键修复）
+            # 1. 解析视频脚本（关键修复）
             logger.info(f"开始解析视频脚本: {type(video_script)}")
+            logger.info(f"视频脚本内容: {video_script[:200]}...")  # 只记录前200字符避免日志过长
 
-            # 尝试解析视频脚本JSON
             try:
-                script_data = json.loads(video_script)
-                logger.info("视频脚本解析为JSON成功")
+                # 首先尝试解析为完整的API响应
+                response_data = json.loads(video_script)
+                logger.info("成功解析为API响应格式")
 
-                # 提取字段
-                if isinstance(script_data, dict):
-                    title = script_data.get("title", title)
-                    text = script_data.get("text", "")
-                    label = script_data.get("label", label)
+                # 提取content字段
+                if ("choices" in response_data and
+                        len(response_data["choices"]) > 0 and
+                        "message" in response_data["choices"][0] and
+                        "content" in response_data["choices"][0]["message"]):
 
-                    logger.info(f"从JSON中提取: title={title}, text长度={len(text)}, label={label}")
+                    content_str = response_data["choices"][0]["message"]["content"]
+                    logger.info(f"提取到content字段: {content_str[:100]}...")
+
+                    # 尝试解析content字段中的JSON
+                    try:
+                        content_data = json.loads(content_str)
+                        if isinstance(content_data, dict):
+                            title = content_data.get("title", title)
+                            text = content_data.get("text", "")
+                            label = content_data.get("label", label)
+                            logger.info(f"从content中提取: title={title}, text长度={len(text)}, label={label}")
+                        else:
+                            logger.warning("content字段不是字典格式")
+                    except json.JSONDecodeError:
+                        logger.warning("content字段不是有效JSON，使用原始内容")
+                        text = content_str
                 else:
-                    logger.warning("视频脚本JSON不是字典格式")
+                    logger.warning("API响应格式不符合预期，尝试直接提取字段")
+                    # 尝试直接从响应中提取字段
+                    title = response_data.get("title", title)
+                    text = response_data.get("text", "")
+                    label = response_data.get("label", label)
+
             except json.JSONDecodeError:
                 logger.warning("视频脚本不是有效JSON，尝试其他解析方式")
-
                 # 尝试提取代码块中的JSON
                 json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', video_script, re.DOTALL)
                 if json_match:
@@ -344,8 +357,10 @@ class FeishuSpreadsheetUtil:
                         logger.info(f"从代码块中提取: title={title}, text长度={len(text)}, label={label}")
                     except json.JSONDecodeError:
                         logger.warning("代码块中的JSON解析失败")
+                        text = video_script
                 else:
-                    logger.warning("没有找到JSON代码块")
+                    logger.warning("没有找到JSON代码块，使用原始文本作为正文")
+                    text = video_script
 
             # 确保标题不为空
             title = title or f"内容策略_{time.strftime('%Y%m%d%H%M')}"
@@ -353,14 +368,14 @@ class FeishuSpreadsheetUtil:
             title = re.sub(r'[\\/*?:"<>|]', '-', title)
             logger.info(f"最终使用的标题: {title}")
 
-            # 3. 准备要写入的数据
+            # 2. 准备要写入的数据
             cell_data = {
                 "B9": text[:1000] if len(text) > 1000 else text,  # 正文写入B9
                 "B10": label[:100] if len(label) > 100 else label  # 标签写入B10
             }
             logger.info(f"基础单元格数据: B9长度={len(cell_data['B9'])}, B10={cell_data['B10']}")
 
-            # 4. 添加分镜脚本数据（从A29开始）
+            # 3. 添加分镜脚本数据（从A29开始）- 保持不变
             if shot_list:
                 logger.info(f"开始处理分镜数据，共 {len(shot_list)} 个镜头")
                 for i, shot in enumerate(shot_list):
@@ -380,7 +395,7 @@ class FeishuSpreadsheetUtil:
             else:
                 logger.warning("没有分镜数据，跳过分镜写入逻辑")
 
-            # 5. 创建表格并写入数据
+            # 4. 创建表格并写入数据
             logger.info(
                 f"准备提交的最终单元格数据: B9长度={len(cell_data.get('B9', ''))}, B10={cell_data.get('B10', '')}")
             result = await self.sheet_manager.create_and_write(title, cell_data)
